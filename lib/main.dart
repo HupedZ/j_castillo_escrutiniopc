@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:io' as io;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -367,6 +369,145 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
     });
   }
 
+  // ── QR ──────────────────────────────────────────────────────────────────
+
+  Future<void> _escanearQR() async {
+    final ctrl = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Leer certificado QR'),
+        content: SizedBox(
+          width: 480,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Escanee el QR del certificado oficial con un lector USB o pegue '
+                'el contenido copiado desde su celular:',
+                style: TextStyle(fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                autofocus: true,
+                maxLines: 4,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                decoration: const InputDecoration(
+                  hintText: 'REC 9A...',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+                onSubmitted: (_) => Navigator.pop(ctx, ctrl.text),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text),
+            child: const Text('Aplicar'),
+          ),
+        ],
+      ),
+    );
+    if (result != null && result.trim().isNotEmpty) {
+      _procesarQR(result.trim());
+    }
+  }
+
+  void _procesarQR(String raw) {
+    try {
+      String hex = raw;
+      if (hex.startsWith('REC ')) hex = hex.substring(4);
+      else if (hex.startsWith('REC')) hex = hex.substring(3);
+      hex = hex.replaceAll(RegExp(r'\s+'), '');
+      if (hex.length % 2 != 0) {
+        _setStatus('QR inválido: longitud impar', ok: false);
+        return;
+      }
+      final bytes = Uint8List(hex.length ~/ 2);
+      for (int i = 0; i < bytes.length; i++) {
+        bytes[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+      }
+
+      // Buscar header zlib (78 9C / 78 DA / 78 01 / 78 5E)
+      int zlibStart = -1;
+      for (int i = 0; i < bytes.length - 1; i++) {
+        if (bytes[i] == 0x78) {
+          final b = bytes[i + 1];
+          if (b == 0x9C || b == 0xDA || b == 0x01 || b == 0x5E) {
+            zlibStart = i;
+            break;
+          }
+        }
+      }
+      if (zlibStart < 0) {
+        _setStatus('QR: no se encontró bloque comprimido', ok: false);
+        return;
+      }
+
+      final decompressed = Uint8List.fromList(
+        io.ZLibDecoder().convert(bytes.sublist(zlibStart)));
+
+      if (decompressed.length < 16) {
+        _setStatus('QR: datos insuficientes tras descomprimir', ok: false);
+        return;
+      }
+
+      // Detectar tipo por bytes 6-7 del payload descomprimido
+      final b6 = decompressed[6];
+      final b7 = decompressed[7];
+
+      if (b6 == 0xF0 && b7 == 0x01) {
+        _aplicarQRIntendente(decompressed);
+      } else if (b6 == 0x70 && b7 == 0x0B) {
+        _setStatus('Certificado de Junta Municipal: decodificación en proceso', ok: false);
+      } else {
+        _setStatus('QR: tipo de certificado no reconocido (${b6.toRadixString(16)} ${b7.toRadixString(16)})', ok: false);
+      }
+    } catch (e) {
+      _setStatus('Error procesando QR: $e', ok: false);
+    }
+  }
+
+  static int _bitsMSB(Uint8List data, int startBit, int nBits) {
+    int result = 0;
+    for (int i = 0; i < nBits; i++) {
+      final byteIdx = (startBit + i) ~/ 8;
+      final bitIdx  = 7 - ((startBit + i) % 8);
+      if (byteIdx < data.length) {
+        result = (result << 1) | ((data[byteIdx] >> bitIdx) & 1);
+      }
+    }
+    return result;
+  }
+
+  void _aplicarQRIntendente(Uint8List data) {
+    final l1    = _bitsMSB(data, 67, 8);
+    final l6    = _bitsMSB(data, 75, 8);
+    final l2026 = _bitsMSB(data, 83, 8);
+    final blc   = _bitsMSB(data, 91, 8);
+    final tot   = _bitsMSB(data, 107, 8);
+    final nul   = _bitsMSB(data, 115, 8);
+
+    setState(() {
+      _intCtrl['1']!.text    = l1.toString();
+      _intCtrl['6']!.text    = l6.toString();
+      _intCtrl['2026']!.text = l2026.toString();
+      _intCtrl['B']!.text    = blc.toString();
+    });
+    _setStatus(
+      'QR Intendente cargado — L1:$l1  L6:$l6  L2026:$l2026  Blanco:$blc  Nulo:$nul  Total:$tot',
+      ok: true,
+    );
+  }
+
   // ── Build ────────────────────────────────────────────────────────────────
 
   @override
@@ -375,6 +516,9 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
       bindings: {
         const SingleActivator(LogicalKeyboardKey.keyF, control: true): _finalizar,
         const SingleActivator(LogicalKeyboardKey.keyN, control: true): _nuevo,
+        const SingleActivator(LogicalKeyboardKey.keyQ, control: true): () {
+          if (_mesaConfirmada) _escanearQR();
+        },
       },
       child: Scaffold(
         backgroundColor: const Color(0xFFF0F2F5),
@@ -396,6 +540,13 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
                 ),
               )
             else ...[
+              if (_mesaConfirmada)
+                TextButton.icon(
+                  onPressed: _escanearQR,
+                  icon: const Icon(Icons.qr_code_scanner, color: Colors.white70, size: 18),
+                  label: const Text('Leer QR',
+                      style: TextStyle(color: Colors.white70, fontSize: 12)),
+                ),
               TextButton.icon(
                 onPressed: _finalizar,
                 icon: const Icon(Icons.save_outlined, color: Colors.white70, size: 18),
