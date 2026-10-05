@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -79,6 +80,7 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
 
   bool   _guardando        = false;
   bool   _buscandoMesa     = false;
+  bool   _leyendoImagen    = false;
   bool   _esModificacion   = false;
   bool   _mesaConfirmada   = false;
   String _statusMsg = '';
@@ -508,6 +510,199 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
     );
   }
 
+  // ── Lector de imagen (Gemini) ────────────────────────────────────────────
+
+  static io.File get _keyFile {
+    final home = io.Platform.environment['USERPROFILE']   // Windows
+        ?? io.Platform.environment['HOME']               // macOS/Linux
+        ?? '.';
+    return io.File('$home/.jce_gemini_key');
+  }
+
+  Future<String?> _obtenerGeminiKey() async {
+    if (await _keyFile.exists()) {
+      final k = (await _keyFile.readAsString()).trim();
+      if (k.isNotEmpty) return k;
+    }
+    if (!mounted) return null;
+    final ctrl = TextEditingController();
+    final key = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Configurar API key de Gemini'),
+        content: SizedBox(
+          width: 440,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Para leer certificados por imagen necesitás una API key '
+                'de Google AI Studio (gratuita).\n\n'
+                '1. Entrá a aistudio.google.com\n'
+                '2. Hacé clic en "Get API key"\n'
+                '3. Pegá la key acá:',
+                style: TextStyle(fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                autofocus: true,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  hintText: 'AIza...',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+                onSubmitted: (_) => Navigator.pop(ctx, ctrl.text),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text),
+            child: const Text('Guardar'),
+          ),
+        ],
+      ),
+    );
+    if (key != null && key.trim().isNotEmpty) {
+      await _keyFile.writeAsString(key.trim());
+      return key.trim();
+    }
+    return null;
+  }
+
+  Future<void> _leerImagen() async {
+    final apiKey = await _obtenerGeminiKey();
+    if (apiKey == null) return;
+
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: false,
+    );
+    if (picked == null || picked.files.isEmpty) return;
+
+    final path = picked.files.first.path;
+    if (path == null) return;
+
+    setState(() => _leyendoImagen = true);
+    _setStatus('Leyendo certificado con IA…', ok: true);
+
+    try {
+      final imageBytes = await io.File(path).readAsBytes();
+      final base64Image = base64Encode(imageBytes);
+      final ext = picked.files.first.extension?.toLowerCase() ?? 'jpg';
+      final mime = ext == 'png' ? 'image/png'
+                 : ext == 'webp' ? 'image/webp'
+                 : 'image/jpeg';
+
+      final res = await http.post(
+        Uri.parse(
+          'https://generativelanguage.googleapis.com/v1beta/models/'
+          'gemini-2.0-flash:generateContent?key=$apiKey',
+        ),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'contents': [
+            {
+              'parts': [
+                {
+                  'inline_data': {'mime_type': mime, 'data': base64Image},
+                },
+                {
+                  'text': '''Sos un asistente que lee actas de escrutinio de elecciones municipales del Paraguay (TSJE).
+
+Extraé los votos de esta acta. Las secciones posibles son INTENDENTE y JUNTA MUNICIPAL (concejal).
+
+Para INTENDENTE las listas son: 1, 6, 2026, B (votos en blanco).
+Para JUNTA MUNICIPAL (concejal) las listas son: 1, 3, 4, 6, 9, 20, 68, B (votos en blanco).
+
+Devolvé ÚNICAMENTE el JSON (sin markdown, sin explicación) en este formato exacto:
+{"intendente":{"1":0,"6":0,"2026":0,"B":0},"concejal":{"1":0,"3":0,"4":0,"6":0,"9":0,"20":0,"68":0,"B":0}}
+
+Si una sección no aparece en el acta, devolvé null para esa clave. Si una lista no tiene votos, devolvé 0.''',
+                },
+              ],
+            }
+          ],
+          'generationConfig': {'temperature': 0},
+        }),
+      );
+
+      if (!mounted) return;
+
+      if (res.statusCode != 200) {
+        // API key inválida: borrar para que pida de nuevo
+        if (res.statusCode == 400 || res.statusCode == 403) {
+          try { await _keyFile.delete(); } catch (_) {}
+        }
+        _setStatus('Error Gemini ${res.statusCode}: ${res.body}', ok: false);
+        return;
+      }
+
+      final body = jsonDecode(res.body) as Map;
+      final text = ((((body['candidates'] as List?)?.firstOrNull
+              as Map?)?['content'] as Map?)?['parts'] as List?)
+          ?.firstOrNull
+          ?['text'] as String?;
+
+      if (text == null || text.trim().isEmpty) {
+        _setStatus('Gemini no devolvió texto', ok: false);
+        return;
+      }
+
+      // Limpiar posible markdown ```json ... ```
+      final clean = text.trim()
+          .replaceAll(RegExp(r'^```[a-z]*\n?', multiLine: false), '')
+          .replaceAll('```', '')
+          .trim();
+
+      final json = jsonDecode(clean) as Map;
+      _aplicarDatosImagen(json);
+    } catch (e) {
+      if (mounted) _setStatus('Error: $e', ok: false);
+    } finally {
+      if (mounted) setState(() => _leyendoImagen = false);
+    }
+  }
+
+  void _aplicarDatosImagen(Map json) {
+    int cambios = 0;
+    final intMap = json['intendente'] as Map?;
+    if (intMap != null) {
+      for (final l in _kListasInt) {
+        final v = intMap[l.codigo];
+        if (v != null) {
+          _intCtrl[l.codigo]!.text = v.toString();
+          cambios++;
+        }
+      }
+    }
+    final conMap = json['concejal'] as Map?;
+    if (conMap != null) {
+      for (final l in _kListasCon) {
+        final v = conMap[l.codigo];
+        if (v != null) {
+          _conTotalCtrl[l.codigo]!.text = v.toString();
+          cambios++;
+        }
+      }
+    }
+    setState(() {});
+    if (cambios > 0) {
+      _setStatus('Imagen leída: $cambios campos cargados', ok: true);
+    } else {
+      _setStatus('No se encontraron datos en la imagen', ok: false);
+    }
+  }
+
   // ── Build ────────────────────────────────────────────────────────────────
 
   @override
@@ -519,6 +714,9 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
         const SingleActivator(LogicalKeyboardKey.keyQ, control: true): () {
           if (_mesaConfirmada) _escanearQR();
         },
+        const SingleActivator(LogicalKeyboardKey.keyI, control: true): () {
+          if (_mesaConfirmada) _leerImagen();
+        },
       },
       child: Scaffold(
         backgroundColor: const Color(0xFFF0F2F5),
@@ -527,9 +725,9 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
           foregroundColor: Colors.white,
           title: const Text('Escrutinio Mesa'),
           actions: [
-            if (_guardando)
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 16),
+            if (_guardando || _leyendoImagen)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: Center(
                   child: SizedBox(
                     width: 18,
@@ -540,13 +738,20 @@ class _EscrutinioPageState extends State<EscrutinioPage> {
                 ),
               )
             else ...[
-              if (_mesaConfirmada)
+              if (_mesaConfirmada) ...[
+                TextButton.icon(
+                  onPressed: _leerImagen,
+                  icon: const Icon(Icons.document_scanner, color: Colors.white70, size: 18),
+                  label: const Text('Leer imagen',
+                      style: TextStyle(color: Colors.white70, fontSize: 12)),
+                ),
                 TextButton.icon(
                   onPressed: _escanearQR,
                   icon: const Icon(Icons.qr_code_scanner, color: Colors.white70, size: 18),
                   label: const Text('Leer QR',
                       style: TextStyle(color: Colors.white70, fontSize: 12)),
                 ),
+              ],
               TextButton.icon(
                 onPressed: _finalizar,
                 icon: const Icon(Icons.save_outlined, color: Colors.white70, size: 18),
